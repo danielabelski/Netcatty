@@ -1,14 +1,13 @@
 /**
- * ACP Agent Adapter
+ * Claude Agent SDK Adapter
  *
- * Bridges external agents that support the Agent Client Protocol (ACP)
- * through IPC. The main process runs `createACPProvider` + `streamText`,
- * and forwards stream events to the renderer via IPC.
+ * Bridges Claude Code via the @anthropic-ai/claude-agent-sdk through IPC.
+ * The main process runs `query()` and forwards SDK events to the renderer.
  */
 
 import type { ExternalAgentConfig } from './types';
 
-export interface AcpAgentCallbacks {
+export interface ClaudeAgentCallbacks {
   onTextDelta: (text: string) => void;
   onThinkingDelta: (text: string) => void;
   onThinkingDone: () => void;
@@ -18,65 +17,57 @@ export interface AcpAgentCallbacks {
   onDone: () => void;
 }
 
-interface AcpBridge {
-  aiAcpStream(
+interface ClaudeBridge {
+  aiClaudeStream(
     requestId: string,
     chatSessionId: string,
-    acpCommand: string,
-    acpArgs: string[],
     prompt: string,
-    cwd?: string,
-    apiKey?: string,
+    model?: string,
   ): Promise<{ ok: boolean; error?: string }>;
-  aiAcpCancel(requestId: string): Promise<{ ok: boolean }>;
-  onAiAcpEvent(requestId: string, cb: (event: StreamEvent) => void): () => void;
-  onAiAcpDone(requestId: string, cb: () => void): () => void;
-  onAiAcpError(requestId: string, cb: (error: string) => void): () => void;
+  aiClaudeCancel(requestId: string): Promise<{ ok: boolean }>;
+  onAiClaudeEvent(requestId: string, cb: (event: ClaudeSDKEvent) => void): () => void;
+  onAiClaudeDone(requestId: string, cb: () => void): () => void;
+  onAiClaudeError(requestId: string, cb: (error: string) => void): () => void;
 }
 
-interface StreamEvent {
+interface ClaudeSDKEvent {
   type: string;
   [key: string]: unknown;
 }
 
 /**
- * Run an ACP agent turn.
- * Sends the prompt to the main process which runs streamText() with the ACP provider.
- * Stream events are forwarded back via IPC.
+ * Run a Claude Agent SDK turn.
+ * Sends the prompt to the main process which runs query() with the Claude Agent SDK.
+ * SDK events are forwarded back via IPC.
  */
-export async function runAcpAgentTurn(
+export async function runClaudeAgentTurn(
   bridge: Record<string, (...args: unknown[]) => unknown>,
   requestId: string,
   chatSessionId: string,
-  config: ExternalAgentConfig,
+  _config: ExternalAgentConfig,
   prompt: string,
-  callbacks: AcpAgentCallbacks,
+  callbacks: ClaudeAgentCallbacks,
   signal?: AbortSignal,
-  apiKey?: string,
+  model?: string,
 ): Promise<void> {
-  const acpBridge = bridge as unknown as AcpBridge;
-
-  if (!config.acpCommand) {
-    callbacks.onError('Agent does not support ACP protocol');
-    return;
-  }
+  const claudeBridge = bridge as unknown as ClaudeBridge;
 
   const cleanupFns: (() => void)[] = [];
 
   // Set up event listeners before starting stream
-  const unsubEvent = acpBridge.onAiAcpEvent(requestId, (event: StreamEvent) => {
-    handleStreamEvent(event, callbacks);
+  const unsubEvent = claudeBridge.onAiClaudeEvent(requestId, (event: ClaudeSDKEvent) => {
+    handleClaudeEvent(event, callbacks);
   });
   cleanupFns.push(unsubEvent);
 
   const donePromise = new Promise<void>((resolve) => {
-    const unsubDone = acpBridge.onAiAcpDone(requestId, () => {
+    const unsubDone = claudeBridge.onAiClaudeDone(requestId, () => {
       callbacks.onDone();
       resolve();
     });
     cleanupFns.push(unsubDone);
 
-    const unsubError = acpBridge.onAiAcpError(requestId, (error: string) => {
+    const unsubError = claudeBridge.onAiClaudeError(requestId, (error: string) => {
       callbacks.onError(error);
       resolve();
     });
@@ -90,21 +81,18 @@ export async function runAcpAgentTurn(
       return;
     }
     const onAbort = () => {
-      acpBridge.aiAcpCancel(requestId).catch(() => {});
+      claudeBridge.aiClaudeCancel(requestId).catch(() => {});
     };
     signal.addEventListener('abort', onAbort, { once: true });
     cleanupFns.push(() => signal.removeEventListener('abort', onAbort));
   }
 
-  // Start the ACP stream in the main process
-  acpBridge.aiAcpStream(
+  // Start the Claude stream in the main process
+  claudeBridge.aiClaudeStream(
     requestId,
     chatSessionId,
-    config.acpCommand,
-    config.acpArgs || [],
     prompt,
-    undefined, // cwd
-    apiKey,
+    model,
   ).catch((err: Error) => {
     callbacks.onError(err.message);
   });
@@ -121,26 +109,21 @@ function cleanup(fns: (() => void)[]) {
 }
 
 /**
- * Handle a single stream event from the AI SDK fullStream.
- * Events come from `streamText().fullStream` in the main process.
+ * Handle a single event from the Claude Agent SDK.
  */
-function handleStreamEvent(event: StreamEvent, callbacks: AcpAgentCallbacks) {
+function handleClaudeEvent(event: ClaudeSDKEvent, callbacks: ClaudeAgentCallbacks) {
   switch (event.type) {
     case 'text-delta': {
-      const text = (event.textDelta as string) || (event.delta as string) || '';
+      const text = (event.delta as string) || '';
       if (text) callbacks.onTextDelta(text);
       break;
     }
-    case 'reasoning-start': {
-      // Reasoning block started — nothing to render yet
-      break;
-    }
-    case 'reasoning-delta': {
+    case 'thinking-delta': {
       const text = (event.delta as string) || '';
       if (text) callbacks.onThinkingDelta(text);
       break;
     }
-    case 'reasoning-end': {
+    case 'thinking-done': {
       callbacks.onThinkingDone();
       break;
     }
@@ -163,6 +146,6 @@ function handleStreamEvent(event: StreamEvent, callbacks: AcpAgentCallbacks) {
       callbacks.onError(String(event.error || 'Unknown error'));
       break;
     }
-    // step-start, step-finish, etc. — ignore silently
+    // stream_event, result, tool_progress, tool_use_summary — ignore silently
   }
 }
